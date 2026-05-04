@@ -208,7 +208,7 @@ export default function ThesisAgentRoom() {
         body.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }];
       }
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -239,7 +239,7 @@ The ${target.name} responded:
 As the ${critic.name}, briefly critique this response from your specialist angle (2-4 sentences). What's missing? What's wrong? What does your domain reveal that they missed? Be sharp and specific. If you genuinely agree, say "Concur" and give one supporting point. Don't pad.`;
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
