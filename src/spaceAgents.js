@@ -18,7 +18,9 @@ import {
   appendInconsistency,
 } from './spaceStore.js';
 
-const API_URL = 'https://api.anthropic.com/v1/messages';
+const API_URL = (typeof window !== 'undefined' && window.storage)
+  ? 'https://api.anthropic.com/v1/messages'   // Claude Code hosted env proxies auth
+  : '/api/claude';                              // Vercel deployment proxy
 const MODEL = 'claude-sonnet-4-20250514';
 
 // Strip code fences / leading prose to recover JSON. Defensive.
