@@ -1,10 +1,39 @@
 // Persistent store for the Space Economy Dashboard.
-// Uses the same window.storage API as ThesisAgentRoom.
+// Tries window.storage (Claude Code env) first, then falls back to
+// localStorage (Vercel / static deploys).
 
 import { COMPANIES, CONNECTIONS, TRACKED_FIELDS } from './spaceData.js';
 
 const KEY = 'space:dashboard';
 const SCHEMA_VERSION = 1;
+
+// Storage adapter: prefers Claude Code env's window.storage, falls back to localStorage.
+const storage = {
+  async get(key) {
+    if (typeof window === 'undefined') return null;
+    if (window.storage?.get) {
+      try { return await window.storage.get(key); } catch { /* fall through */ }
+    }
+    try {
+      const v = window.localStorage?.getItem(key);
+      return v ? { value: v } : null;
+    } catch { return null; }
+  },
+  async set(key, value) {
+    if (typeof window === 'undefined') return false;
+    if (window.storage?.set) {
+      try { await window.storage.set(key, value); return true; } catch { /* fall through */ }
+    }
+    try { window.localStorage?.setItem(key, value); return true; } catch { return false; }
+  },
+  async delete(key) {
+    if (typeof window === 'undefined') return false;
+    if (window.storage?.delete) {
+      try { await window.storage.delete(key); } catch { /* fall through */ }
+    }
+    try { window.localStorage?.removeItem(key); return true; } catch { return false; }
+  },
+};
 
 // Anchor the initial timestamps to ~36 hours ago so the first scheduler tick
 // has actual work to do (prioritizing the stalest fields).
@@ -56,9 +85,10 @@ function makeInitialState() {
       failures: 0,
     },
     settings: {
-      autoRefresh: false,           // off by default
-      tickIntervalMin: 30,          // when the page is open
-      perTickFieldBudget: 6,        // fields refreshed per tick
+      autoRefresh: true,            // ON by default — agents start working immediately
+      tickIntervalMin: 15,          // tick every 15 min while page is open
+      perTickFieldBudget: 14,       // 14 fields × 4 ticks/hr ≈ full sweep in ~7.5h
+      perTickCompanyParallel: 3,    // process N companies in parallel per tick
       fullSweepTargetHours: 48,
     },
   };
@@ -66,7 +96,7 @@ function makeInitialState() {
 
 export async function loadDashboardState() {
   try {
-    const result = await window.storage.get(KEY);
+    const result = await storage.get(KEY);
     if (!result) return null;
     const parsed = JSON.parse(result.value);
     if (parsed?.schemaVersion !== SCHEMA_VERSION) return null;
@@ -79,8 +109,7 @@ export async function loadDashboardState() {
 
 export async function saveDashboardState(state) {
   try {
-    await window.storage.set(KEY, JSON.stringify(state));
-    return true;
+    return await storage.set(KEY, JSON.stringify(state));
   } catch (err) {
     console.warn('saveDashboardState failed', err);
     return false;
@@ -89,7 +118,7 @@ export async function saveDashboardState(state) {
 
 export async function clearDashboardState() {
   try {
-    await window.storage.delete(KEY);
+    await storage.delete(KEY);
     return true;
   } catch {
     return false;

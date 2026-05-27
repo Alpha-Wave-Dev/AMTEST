@@ -203,90 +203,137 @@ export async function runVerifier(company, prevFields, newFields, log = () => {}
 
 // ── TICK SCHEDULER ───────────────────────────────────────────────────────────
 
-// Run one tick: pick stalest fields, group by company, seek + verify, return new state.
-//
-// `setState` is a setter that receives an updater function — we use it to push
-// log lines / patches as they arrive (so the UI updates in real time).
+// Process one company end-to-end: seek → verify → apply patches.
+async function processCompany(companyId, fieldIds, getState, setState) {
+  const company = getState().companies[companyId];
+  if (!company) return;
+
+  let seekerOut = null;
+  try {
+    seekerOut = await runSeeker(company, fieldIds, (entry) => {
+      setState(s => appendLog(s, entry));
+    });
+  } catch (err) {
+    setState(s => appendLog({ ...s, meta: { ...s.meta, failures: s.meta.failures + 1 } }, {
+      kind: 'error', companyId, summary: `Seeker failed for ${company.name}: ${err.message}`,
+    }));
+    return;
+  }
+
+  const prevFields = {};
+  for (const fid of fieldIds) prevFields[fid] = company.fields[fid];
+
+  let verifierOut = null;
+  try {
+    verifierOut = await runVerifier(company, prevFields, seekerOut, (entry) => {
+      setState(s => appendLog(s, entry));
+    });
+  } catch (err) {
+    setState(s => appendLog(s, {
+      kind: 'error', companyId, summary: `Verifier failed for ${company.name}: ${err.message}`,
+    }));
+    verifierOut = Object.fromEntries(fieldIds.map(id => [id, { status: 'weak_source', notes: 'verifier unreachable' }]));
+  }
+
+  setState(s => {
+    let next = s;
+    for (const fid of fieldIds) {
+      const sk = seekerOut[fid];
+      const vf = verifierOut[fid];
+      next = applyFieldPatch(next, companyId, fid, {
+        value: sk.value,
+        sources: sk.sources,
+      }, {
+        verifierStatus: vf.status,
+        verifierNotes: vf.notes,
+        verifiedAt: Date.now(),
+      });
+      if (vf.status !== 'ok') {
+        next = appendInconsistency(next, {
+          companyId,
+          companyName: company.name,
+          field: fid,
+          fieldLabel: TRACKED_FIELDS.find(f => f.id === fid)?.label,
+          prev: prevFields[fid]?.value ?? null,
+          next: sk.value,
+          status: vf.status,
+          notes: vf.notes,
+          sources: sk.sources,
+        });
+      }
+    }
+    next = appendLog(next, { kind: 'patch', companyId, summary: `Patched ${fieldIds.length} fields on ${company.name}` });
+    next = { ...next, meta: { ...next.meta, successes: next.meta.successes + 1 } };
+    return next;
+  });
+}
+
+// Run companies through processCompany with a fixed concurrency cap.
+async function runWithConcurrency(items, concurrency, worker) {
+  const queue = [...items];
+  const active = [];
+  while (queue.length || active.length) {
+    while (active.length < concurrency && queue.length) {
+      const item = queue.shift();
+      const p = worker(item).finally(() => {
+        const i = active.indexOf(p);
+        if (i !== -1) active.splice(i, 1);
+      });
+      active.push(p);
+    }
+    if (active.length) await Promise.race(active);
+  }
+}
+
+// Run one tick: pick stalest fields, group by company, seek + verify in parallel.
 export async function runTick(getState, setState, opts = {}) {
   const state0 = getState();
   const budget = opts.budget ?? state0.settings.perTickFieldBudget ?? 6;
+  const concurrency = opts.concurrency ?? state0.settings.perTickCompanyParallel ?? 3;
   const targets = pickStaleTargets(state0, budget);
   if (!targets.length) return;
 
   setState(s => appendLog({ ...s, meta: { ...s.meta, lastTickAt: Date.now(), ticks: s.meta.ticks + 1 } }, {
     kind: 'tick',
-    summary: `Tick #${state0.meta.ticks + 1}: refreshing ${targets.length} fields across ${new Set(targets.map(t => t.companyId)).size} companies`,
+    summary: `Tick #${state0.meta.ticks + 1}: refreshing ${targets.length} fields across ${new Set(targets.map(t => t.companyId)).size} companies (×${concurrency} parallel)`,
   }));
 
-  // Group by company
   const byCompany = {};
   for (const t of targets) {
     (byCompany[t.companyId] = byCompany[t.companyId] || []).push(t.fieldId);
   }
 
-  for (const companyId of Object.keys(byCompany)) {
-    const company = getState().companies[companyId];
-    const fieldIds = byCompany[companyId];
-    let seekerOut = null;
-    try {
-      seekerOut = await runSeeker(company, fieldIds, (entry) => {
-        setState(s => appendLog(s, entry));
-      });
-    } catch (err) {
-      setState(s => appendLog({ ...s, meta: { ...s.meta, failures: s.meta.failures + 1 } }, {
-        kind: 'error', companyId, summary: `Seeker failed for ${company.name}: ${err.message}`,
-      }));
-      continue;
+  await runWithConcurrency(
+    Object.entries(byCompany),
+    concurrency,
+    ([companyId, fieldIds]) => processCompany(companyId, fieldIds, getState, setState),
+  );
+}
+
+// Loop ticks back-to-back until every field has been populated at least once
+// (or we hit a hard tick cap). Used by the "Populate empty fields" CTA.
+export async function runUntilPopulated(getState, setState, opts = {}) {
+  const maxTicks = opts.maxTicks ?? 120;
+  const budget = opts.budget ?? 20;
+  const concurrency = opts.concurrency ?? 4;
+  for (let i = 0; i < maxTicks; i++) {
+    const s = getState();
+    const empty = countEmptyFields(s);
+    if (empty === 0) {
+      setState(st => appendLog(st, { kind: 'tick', summary: 'Initial population complete — all fields populated at least once.' }));
+      return;
     }
-
-    // Build prevFields snapshot for verifier
-    const prevFields = {};
-    for (const fid of fieldIds) prevFields[fid] = company.fields[fid];
-
-    let verifierOut = null;
-    try {
-      verifierOut = await runVerifier(company, prevFields, seekerOut, (entry) => {
-        setState(s => appendLog(s, entry));
-      });
-    } catch (err) {
-      setState(s => appendLog(s, {
-        kind: 'error', companyId, summary: `Verifier failed for ${company.name}: ${err.message}`,
-      }));
-      // Continue: patch anyway, but mark all as unverified
-      verifierOut = Object.fromEntries(fieldIds.map(id => [id, { status: 'weak_source', notes: 'verifier unreachable' }]));
-    }
-
-    // Apply patches
-    setState(s => {
-      let next = s;
-      for (const fid of fieldIds) {
-        const sk = seekerOut[fid];
-        const vf = verifierOut[fid];
-        next = applyFieldPatch(next, companyId, fid, {
-          value: sk.value,
-          sources: sk.sources,
-        }, {
-          verifierStatus: vf.status,
-          verifierNotes: vf.notes,
-          verifiedAt: Date.now(),
-        });
-        if (vf.status !== 'ok') {
-          next = appendInconsistency(next, {
-            companyId,
-            companyName: company.name,
-            field: fid,
-            fieldLabel: TRACKED_FIELDS.find(f => f.id === fid)?.label,
-            prev: prevFields[fid]?.value ?? null,
-            next: sk.value,
-            status: vf.status,
-            notes: vf.notes,
-            sources: sk.sources,
-          });
-        }
-      }
-      next = appendLog(next, { kind: 'patch', companyId, summary: `Patched ${fieldIds.length} fields on ${company.name}` });
-      next = { ...next, meta: { ...next.meta, successes: next.meta.successes + 1 } };
-      return next;
-    });
+    setState(st => appendLog(st, { kind: 'tick', summary: `Burst tick ${i + 1}/${maxTicks} · ${empty} empty fields remaining` }));
+    await runTick(getState, setState, { budget, concurrency });
   }
+}
+
+export function countEmptyFields(state) {
+  let n = 0;
+  for (const co of Object.values(state.companies)) {
+    for (const f of TRACKED_FIELDS) {
+      if (co.fields[f.id].value == null) n++;
+    }
+  }
+  return n;
 }

@@ -16,7 +16,7 @@ import {
   resolveInconsistency,
   fieldAgeMs,
 } from './spaceStore.js';
-import { runTick } from './spaceAgents.js';
+import { runTick, runUntilPopulated, countEmptyFields } from './spaceAgents.js';
 
 // ── theme ────────────────────────────────────────────────────────────────────
 const THEME = {
@@ -133,6 +133,22 @@ export default function SpaceEconomyDashboard() {
     } finally {
       setRunning(false);
       setTimeout(() => setStatusMsg(''), 4000);
+    }
+  }, [running, getState, setState]);
+
+  // Burst-populate every empty field. Runs ticks back-to-back until done.
+  const triggerPopulate = useCallback(async () => {
+    if (running) return;
+    setRunning(true);
+    setStatusMsg('Population sprint started — this will take several minutes.');
+    try {
+      await runUntilPopulated(getState, setState);
+      setStatusMsg('Population sprint finished.');
+    } catch (err) {
+      setStatusMsg(`Population failed: ${err.message}`);
+    } finally {
+      setRunning(false);
+      setTimeout(() => setStatusMsg(''), 6000);
     }
   }, [running, getState, setState]);
 
@@ -258,6 +274,8 @@ export default function SpaceEconomyDashboard() {
         running={running}
         statusMsg={statusMsg}
         now={now}
+        emptyCount={countEmptyFields(state)}
+        onPopulateAll={triggerPopulate}
         onTickNow={triggerTick}
         onToggleAuto={() => setState(s => ({ ...s, settings: { ...s.settings, autoRefresh: !s.settings.autoRefresh } }))}
         onChangeInterval={(min) => setState(s => ({ ...s, settings: { ...s.settings, tickIntervalMin: min } }))}
@@ -457,7 +475,7 @@ export default function SpaceEconomyDashboard() {
 }
 
 // ── TOP BAR ─────────────────────────────────────────────────────────────────
-function TopBar({ state, stats, running, statusMsg, now, onTickNow, onToggleAuto, onChangeInterval, onChangeBudget, onReset }) {
+function TopBar({ state, stats, running, statusMsg, now, emptyCount, onPopulateAll, onTickNow, onToggleAuto, onChangeInterval, onChangeBudget, onReset }) {
   const { autoRefresh, tickIntervalMin, perTickFieldBudget, fullSweepTargetHours } = state.settings;
   const sweepMath = Math.round((stats.total / perTickFieldBudget) * (tickIntervalMin / 60));
   const lastTick = state.meta.lastTickAt ? freshnessLabel(now - state.meta.lastTickAt) : 'never';
@@ -506,9 +524,17 @@ function TopBar({ state, stats, running, statusMsg, now, onTickNow, onToggleAuto
         {autoRefresh ? 'Auto-refresh ON' : 'Auto-refresh OFF'}
       </button>
 
+      {emptyCount > 0 && (
+        <button onClick={onPopulateAll} disabled={running}
+          title={`${emptyCount} fields have never been gathered. This runs ticks back-to-back until everything has at least one value.`}
+          style={{ ...btn('#a78bfa'), color: '#04060d', opacity: running ? 0.6 : 1 }}>
+          <Play size={12} /> Populate {emptyCount} empties
+        </button>
+      )}
+
       <button onClick={onTickNow} disabled={running} style={{ ...btn(THEME.accent), color: '#04060d', opacity: running ? 0.6 : 1 }}>
         <RefreshCw size={12} className={running ? 'spin' : ''} />
-        {running ? 'Ticking…' : 'Tick now'}
+        {running ? 'Working…' : 'Tick now'}
       </button>
 
       <button onClick={onReset} title="Reset all data" style={btn()}>
